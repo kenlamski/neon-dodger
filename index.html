@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Neon Dodger</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%; background: #05060d;
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    color: #e8f0ff; overflow: hidden;
+    user-select: none;
+  }
+  #wrap { position: fixed; inset: 0; display: grid; place-items: center; }
+  canvas { background: radial-gradient(ellipse at center, #0b0f24 0%, #02030a 70%); box-shadow: 0 0 60px #00eaff22, inset 0 0 80px #000; border-radius: 10px; }
+  #hud {
+    position: absolute; top: 18px; left: 50%; transform: translateX(-50%);
+    display: flex; gap: 28px; font-variant-numeric: tabular-nums;
+    letter-spacing: 2px; text-transform: uppercase; font-size: 14px;
+    pointer-events: none; text-shadow: 0 0 10px #00eaff;
+  }
+  #hud span b { color: #00eaff; font-weight: 600; margin-left: 6px; }
+  #overlay {
+    position: absolute; inset: 0; display: grid; place-items: center;
+    background: radial-gradient(ellipse at center, #000a 0%, #000d 100%);
+    text-align: center;
+  }
+  #overlay.hidden { display: none; }
+  #overlay h1 {
+    font-size: 64px; margin: 0 0 8px; letter-spacing: 8px;
+    background: linear-gradient(90deg, #ff2bd6, #00eaff);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    text-shadow: 0 0 40px #00eaff66;
+  }
+  #overlay p { opacity: .75; margin: 4px 0; letter-spacing: 1px; }
+  #overlay .big { font-size: 22px; color: #ffd86b; margin-top: 18px; }
+  kbd {
+    display: inline-block; padding: 2px 8px; border-radius: 4px;
+    background: #111a2e; border: 1px solid #2a3555; color: #cfe8ff;
+    font-size: 12px; margin: 0 2px;
+  }
+  #hint { position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%);
+    font-size: 11px; opacity: .45; letter-spacing: 2px; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c" width="900" height="620"></canvas></div>
+<div id="hud">
+  <span>SCORE<b id="score">0</b></span>
+  <span>LEVEL<b id="level">1</b></span>
+  <span>LIVES<b id="lives">3</b></span>
+  <span>BEST<b id="best">0</b></span>
+</div>
+<div id="overlay">
+  <div>
+    <h1>NEON DODGER</h1>
+    <p>Dodge the asteroids. Grab the orbs.</p>
+    <p><kbd>←</kbd><kbd>→</kbd> or <kbd>A</kbd><kbd>D</kbd> to move · <kbd>Space</kbd> to dash</p>
+    <p class="big" id="msg">Press any key to play</p>
+  </div>
+</div>
+<div id="hint">Opus 4.7 · built for a friend</div>
+
+<script>
+(() => {
+  const cvs = document.getElementById('c');
+  const ctx = cvs.getContext('2d');
+  const W = cvs.width, H = cvs.height;
+  const scoreEl = document.getElementById('score');
+  const levelEl = document.getElementById('level');
+  const livesEl = document.getElementById('lives');
+  const bestEl  = document.getElementById('best');
+  const overlay = document.getElementById('overlay');
+  const msg     = document.getElementById('msg');
+
+  // --- audio (Web Audio, generated on the fly) ---
+  let ac;
+  const ensureAudio = () => {
+    if (!ac) ac = new (window.AudioContext || window.webkitAudioContext)();
+    if (ac.state === 'suspended') ac.resume();
+  };
+  const beep = (freq, dur = 0.08, type = 'square', vol = 0.05) => {
+    if (!ac || ac.state !== 'running') return;
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.type = type; o.frequency.value = freq;
+    g.gain.value = vol;
+    o.connect(g).connect(ac.destination);
+    o.start();
+    g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur);
+    o.stop(ac.currentTime + dur);
+  };
+
+  // --- state ---
+  const state = {
+    running: false, over: false,
+    score: 0, level: 1, lives: 3,
+    best: +localStorage.getItem('nd_best') || 0,
+    t: 0, spawnT: 0, orbT: 0,
+    dashT: 0,
+    shakeT: 0, shakeMag: 0,
+    keys: {}, particles: [], rocks: [], orbs: [], stars: []
+  };
+  bestEl.textContent = state.best;
+
+  // starfield background
+  for (let i = 0; i < 140; i++) {
+    state.stars.push({ x: Math.random()*W, y: Math.random()*H, z: Math.random()*1+0.2 });
+  }
+
+  const player = {
+    x: W/2, y: H - 70, r: 14, vx: 0, trail: []
+  };
+
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+
+  // --- input ---
+  const BLOCKED = new Set([' ', 'arrowleft', 'arrowright', 'arrowup', 'arrowdown']);
+  addEventListener('keydown', e => {
+    const k = e.key.toLowerCase();
+    if (BLOCKED.has(k)) e.preventDefault();
+    ensureAudio();
+    state.keys[k] = true;
+    if (!state.running) { startGame(); return; }
+    if (k === ' ' && state.dashT <= 0) {
+      state.dashT = 0.35;
+      // kick the ship in the current facing direction (or last held)
+      const left  = state.keys['arrowleft']  || state.keys['a'];
+      const right = state.keys['arrowright'] || state.keys['d'];
+      const dir = right ? 1 : left ? -1 : (player.vx >= 0 ? 1 : -1);
+      player.vx = dir * 900;
+      burst(player.x, player.y + player.r, '#00eaff', 14, 260);
+      beep(680, .1, 'sawtooth', .08);
+      beep(1100, .08, 'square', .05);
+    }
+  }, { passive: false });
+  addEventListener('keyup', e => state.keys[e.key.toLowerCase()] = false);
+  addEventListener('pointerdown', ensureAudio);
+
+  function startGame() {
+    if (state.over) {
+      state.score = 0; state.level = 1; state.lives = 3;
+      state.rocks.length = 0; state.orbs.length = 0; state.particles.length = 0;
+      player.x = W/2; player.vx = 0;
+      state.over = false;
+    }
+    state.running = true;
+    overlay.classList.add('hidden');
+  }
+
+  function gameOver() {
+    state.running = false; state.over = true;
+    if (state.score > state.best) {
+      state.best = state.score;
+      localStorage.setItem('nd_best', state.best);
+      bestEl.textContent = state.best;
+      msg.textContent = 'NEW BEST · press any key';
+    } else {
+      msg.textContent = 'Press any key to retry';
+    }
+    overlay.classList.remove('hidden');
+    beep(120, .4, 'sawtooth', .08);
+  }
+
+  // --- spawning ---
+  function spawnRock() {
+    const size = rand(14, 34);
+    state.rocks.push({
+      x: rand(size, W - size),
+      y: -size,
+      r: size,
+      vy: rand(90, 170) + state.level * 18,
+      vx: rand(-30, 30),
+      rot: Math.random() * Math.PI * 2,
+      vr: rand(-1.2, 1.2),
+      hue: rand(-10, 30)
+    });
+  }
+  function spawnOrb() {
+    state.orbs.push({
+      x: rand(30, W - 30), y: -20, r: 8,
+      vy: rand(120, 160),
+      bob: Math.random() * Math.PI * 2
+    });
+  }
+
+  function burst(x, y, color, n = 20, spd = 260) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const s = rand(spd*0.3, spd);
+      state.particles.push({
+        x, y, vx: Math.cos(a)*s, vy: Math.sin(a)*s,
+        life: rand(0.4, 0.9), age: 0, color, size: rand(1.5, 3.5)
+      });
+    }
+  }
+
+  // --- update / render ---
+  let last = performance.now();
+  function loop(now) {
+    const dt = Math.min(0.033, (now - last) / 1000);
+    last = now;
+    update(dt);
+    render();
+    requestAnimationFrame(loop);
+  }
+
+  function update(dt) {
+    // stars always move
+    for (const s of state.stars) {
+      s.y += (20 + s.z * 40) * dt * (state.running ? 1 : 0.4);
+      if (s.y > H) { s.y = 0; s.x = Math.random() * W; }
+    }
+
+    if (!state.running) return;
+
+    state.t += dt;
+    state.spawnT -= dt; state.orbT -= dt;
+    state.dashT = Math.max(0, state.dashT - dt);
+    state.shakeT = Math.max(0, state.shakeT - dt);
+
+    // difficulty ramp
+    const targetLevel = 1 + Math.floor(state.score / 500);
+    if (targetLevel > state.level) { state.level = targetLevel; beep(880, .1, 'triangle', .06); }
+
+    const spawnEvery = Math.max(0.25, 0.9 - state.level * 0.06);
+    if (state.spawnT <= 0) { spawnRock(); state.spawnT = spawnEvery; }
+    if (state.orbT <= 0) { spawnOrb(); state.orbT = rand(2.4, 4.2); }
+
+    // player movement
+    const left  = state.keys['arrowleft']  || state.keys['a'];
+    const right = state.keys['arrowright'] || state.keys['d'];
+    if (state.dashT > 0) {
+      // coast on dash impulse, light friction
+      player.vx *= 0.94;
+    } else {
+      const target = (right ? 1 : 0) - (left ? 1 : 0);
+      player.vx += (target * 360 - player.vx) * Math.min(1, dt * 10);
+    }
+    player.x = clamp(player.x + player.vx * dt, player.r, W - player.r);
+
+    player.trail.unshift({ x: player.x, y: player.y });
+    if (player.trail.length > 14) player.trail.pop();
+
+    // score over time
+    state.score += Math.round(dt * 60);
+    scoreEl.textContent = state.score;
+    levelEl.textContent = state.level;
+    livesEl.textContent = state.lives;
+
+    // rocks
+    for (let i = state.rocks.length - 1; i >= 0; i--) {
+      const r = state.rocks[i];
+      r.y += r.vy * dt; r.x += r.vx * dt; r.rot += r.vr * dt;
+      if (r.x < r.r || r.x > W - r.r) r.vx *= -1;
+      if (r.y > H + r.r) { state.rocks.splice(i, 1); continue; }
+
+      const dx = r.x - player.x, dy = r.y - player.y;
+      if (dx*dx + dy*dy < (r.r + player.r) * (r.r + player.r)) {
+        state.rocks.splice(i, 1);
+        state.lives--;
+        state.shakeT = 0.35; state.shakeMag = 14;
+        burst(player.x, player.y, '#ff3a6e', 36, 320);
+        beep(180, .25, 'sawtooth', .09);
+        if (state.lives <= 0) { gameOver(); return; }
+      }
+    }
+
+    // orbs
+    for (let i = state.orbs.length - 1; i >= 0; i--) {
+      const o = state.orbs[i];
+      o.y += o.vy * dt; o.bob += dt * 4;
+      if (o.y > H + o.r) { state.orbs.splice(i, 1); continue; }
+      const dx = o.x - player.x, dy = o.y - player.y;
+      if (dx*dx + dy*dy < (o.r + player.r + 4) ** 2) {
+        state.orbs.splice(i, 1);
+        state.score += 100;
+        burst(o.x, o.y, '#ffd86b', 24, 240);
+        beep(1200, .09, 'triangle', .06);
+        beep(1600, .09, 'triangle', .05);
+      }
+    }
+
+    // particles
+    for (let i = state.particles.length - 1; i >= 0; i--) {
+      const p = state.particles[i];
+      p.age += dt; p.x += p.vx * dt; p.y += p.vy * dt;
+      p.vx *= 0.96; p.vy *= 0.96;
+      if (p.age >= p.life) state.particles.splice(i, 1);
+    }
+  }
+
+  function render() {
+    ctx.save();
+
+    // screen shake
+    if (state.shakeT > 0) {
+      const m = state.shakeMag * (state.shakeT / 0.35);
+      ctx.translate((Math.random()-.5) * m, (Math.random()-.5) * m);
+    }
+
+    ctx.clearRect(0, 0, W, H);
+
+    // stars
+    for (const s of state.stars) {
+      ctx.globalAlpha = 0.3 + s.z * 0.5;
+      ctx.fillStyle = '#9fd8ff';
+      ctx.fillRect(s.x, s.y, 1.5, 1.5);
+    }
+    ctx.globalAlpha = 1;
+
+    // orbs
+    for (const o of state.orbs) {
+      const glow = ctx.createRadialGradient(o.x, o.y, 0, o.x, o.y, o.r * 4);
+      glow.addColorStop(0, '#ffd86bcc');
+      glow.addColorStop(1, '#ffd86b00');
+      ctx.fillStyle = glow;
+      ctx.beginPath(); ctx.arc(o.x, o.y, o.r * 4, 0, Math.PI*2); ctx.fill();
+
+      ctx.fillStyle = '#fff3b0';
+      ctx.beginPath(); ctx.arc(o.x, o.y + Math.sin(o.bob)*2, o.r, 0, Math.PI*2); ctx.fill();
+    }
+
+    // rocks
+    for (const r of state.rocks) {
+      ctx.save();
+      ctx.translate(r.x, r.y);
+      ctx.rotate(r.rot);
+      const g = ctx.createRadialGradient(0, 0, 0, 0, 0, r.r);
+      g.addColorStop(0, `hsl(${200 + r.hue}, 70%, 60%)`);
+      g.addColorStop(1, `hsl(${220 + r.hue}, 80%, 20%)`);
+      ctx.fillStyle = g;
+      ctx.strokeStyle = `hsl(${190 + r.hue}, 100%, 70%)`;
+      ctx.lineWidth = 2;
+      ctx.shadowBlur = 18; ctx.shadowColor = `hsl(${190 + r.hue}, 100%, 60%)`;
+      ctx.beginPath();
+      const sides = 7;
+      for (let i = 0; i <= sides; i++) {
+        const a = (i / sides) * Math.PI * 2;
+        const rr = r.r * (0.82 + 0.18 * Math.sin(i * 2.3));
+        const x = Math.cos(a) * rr, y = Math.sin(a) * rr;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+      ctx.restore();
+    }
+
+    // player trail
+    for (let i = player.trail.length - 1; i >= 0; i--) {
+      const t = player.trail[i];
+      const a = (1 - i / player.trail.length) * 0.6;
+      ctx.fillStyle = `rgba(0, 234, 255, ${a})`;
+      ctx.beginPath();
+      ctx.arc(t.x, t.y, player.r * (1 - i/player.trail.length) * 0.9, 0, Math.PI*2);
+      ctx.fill();
+    }
+
+    // player ship
+    ctx.save();
+    ctx.translate(player.x, player.y);
+    ctx.shadowBlur = 24; ctx.shadowColor = '#00eaff';
+    ctx.fillStyle = state.dashT > 0 ? '#ff2bd6' : '#00eaff';
+    ctx.beginPath();
+    ctx.moveTo(0, -player.r);
+    ctx.lineTo(player.r, player.r);
+    ctx.lineTo(0, player.r * 0.5);
+    ctx.lineTo(-player.r, player.r);
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.restore();
+
+    // particles
+    for (const p of state.particles) {
+      const a = 1 - p.age / p.life;
+      ctx.globalAlpha = a;
+      ctx.fillStyle = p.color;
+      ctx.shadowBlur = 10; ctx.shadowColor = p.color;
+      ctx.fillRect(p.x - p.size/2, p.y - p.size/2, p.size, p.size);
+    }
+    ctx.globalAlpha = 1; ctx.shadowBlur = 0;
+
+    ctx.restore();
+  }
+
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
